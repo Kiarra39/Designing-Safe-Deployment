@@ -3,63 +3,85 @@ name: Deploy Orion API
 on:
   push:
     branches:
-      - '*'
+      - main
+      - master
+      - 'fix/**'
+  pull_request:
+    branches:
+      - main
+      - master
 
 jobs:
-  deploy:
+  validate:
     runs-on: ubuntu-latest
-    environment: production
-
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
-
-      - name: Set up Node
-        uses: actions/setup-node@v3
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
-          node-version: '16'
-
-      - name: Install dependencies
-        run: npm install
-
-      - name: Deploy to production
-        env:
-          DEPLOY_TOKEN: ${{ secrets.DEPLOY_TOKEN }}
-          DB_PASS: ${{ secrets.DB_PASS }}
-          JWT_SECRET: ${{ secrets.JWT_SECRET }}
-        run: |
-          echo "Deploying version $APP_VERSION to production..."
-          bash scripts/deploy.sh
-
-      - name: Run smoke test
-        run: |
-          sleep 5
-          curl -f http://production.orion.internal/health || echo "Smoke test failed, continuing anyway"
-
-      - name: Notify team
-        if: always()
-        run: echo "Deployment finished with status ${{ job.status }}"
-
-  lint:
-    runs-on: ubuntu-latest
-    needs: deploy
-
-    steps:
-      - uses: actions/checkout@v3
-      - uses: actions/setup-node@v3
-        with:
-          node-version: '16'
-      - run: npm install
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run build
       - run: npm run lint
-
-  test:
-    runs-on: ubuntu-latest
-    needs: lint
-
-    steps:
-      - uses: actions/checkout@v3
-      - uses: actions/setup-node@v3
-        with:
-          node-version: '16'
-      - run: npm install
       - run: npm test
+
+  security:
+    runs-on: ubuntu-latest
+    needs: validate
+    if: github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm audit --omit=dev --audit-level=high
+
+  deploy-staging:
+    runs-on: ubuntu-latest
+    needs: [validate, security]
+    if: github.event_name == 'push'
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "Deploying to staging"
+      - run: bash scripts/deploy.sh
+        env:
+          DRY_RUN: 1
+          IMAGE_TAG: staging-${{ github.sha }}
+      - run: |
+          node src/index.js > /tmp/orion-api.log 2>&1 &
+          APP_PID=$!
+          trap 'kill $APP_PID' EXIT
+          for i in {1..15}; do
+            if curl -fsS http://127.0.0.1:3000/health >/tmp/health.out 2>/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          bash scripts/healthcheck.sh http://127.0.0.1:3000
+
+  deploy-production:
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment:
+      name: production
+      url: https://example.com
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "Deploy to production requires approval"
+      - run: bash scripts/deploy.sh
+        env:
+          DRY_RUN: 1
+          IMAGE_TAG: prod-${{ github.sha }}
+
+  verify:
+    runs-on: ubuntu-latest
+    needs: [deploy-staging, deploy-production]
+    if: always()
+    steps:
+      - run: echo "Workflow completed"
+      - if: ${{ failure() || needs.deploy-staging.result != 'success' || needs.deploy-production.result != 'success' }}
+        run: bash scripts/rollback.sh previous
